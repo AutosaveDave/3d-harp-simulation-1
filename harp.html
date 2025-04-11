@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Harp Simulation</title>
+    <link rel="icon" href="data:,">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        Hold SPACEBAR to move camera<br>
+        Click on a string to pluck it<br>
+        Hold and drag a tuning peg to adjust tension<br>
+        Click and drag across strings to strum
+    </div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lodash": "https://cdn.jsdelivr.net/npm/lodash@4.17.21/+esm",
+                "gsap": "https://cdn.jsdelivr.net/npm/gsap@3.12.2/index.js",
+                "d3": "https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js",
+                "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+                "chart.js": "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        import * as CANNON from 'cannon-es';
+        import _ from 'lodash';
+        import { gsap } from 'gsap';
+
+        let directionalLight; // Variable to store the directional light
+        let directionalLightAngle = 0; // Initial angle for the directional light (in degrees)
+        let stringSegments = []; // Array to store string segment data
+
+        // Physics and audio constants
+        const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        const STRING_TUNINGS = [
+            { note: 'E', octave: 2, freq: 82.41*2 }, // E2
+            { note: 'A', octave: 3, freq: 220.00 }, // A2
+            { note: 'D', octave: 3, freq: 146.83*2 }, // D3
+            { note: 'G', octave: 3, freq: 196.00*2 }  // G3
+        ];
+
+        // Main variables
+        let camera, scene, renderer, controls;
+        let audioContext;
+        let spacebarDown = false;
+        let mouseDown = false;
+        let mousePosition = new THREE.Vector2();
+        let raycaster = new THREE.Raycaster();
+        let intersectedObject = null;
+        let font;
+        let labelMeshes = [];
+        let mouseVelocity = new THREE.Vector2();
+        let lastMousePosition = new THREE.Vector2();
+        let lastMouseTime = 0;
+
+        // Harp components
+        let harpFrame;
+        let strings = [];
+        let tuningPegs = [];
+        let activeDraggingPeg = null;
+        let dragStartY = 0;
+
+        let world;
+
+        // Add these variables at the top with your other global variables
+        let masterGainNode;
+        let activeOscillatorCount = 0;
+
+        // Add this variable at the top with your other global variables
+        let lastFrameTime = 0;
+
+        // Add these variables at the top with your other global variables
+        let activeChordKey = null;
+        let originalTunings = [];
+        const chordTunings = [
+            ["C4", "E4", "G4", "B4"],  // C major 7 (key 1)
+            ["D4", "F4", "A4", "C5"],  // D minor 7 (key 2)
+            ["E4", "G4", "B4", "D5"],  // E minor 7 (key 3)
+            ["F4", "A4", "C5", "E5"],  // F major 7 (key 4)
+            ["G4", "B4", "D5", "F5"],  // G dominant 7 (key 5)
+            ["A4", "C5", "E5", "G5"],  // A minor 7 (key 6)
+            ["B4", "D5", "F5", "A5"]   // B half-diminished 7 (key 7)
+        ];
+
+        // Initialize the application
+        init();
+        animate();
+
+        function init() {
+            setupPhysics();
+            setupScene();
+            setupLighting();
+            setupHarp();
+            setupEventListeners();
+            loadFont();
+            initAudio();
+            
+            // Start animation loop with proper timing
+            lastFrameTime = 0;
+            requestAnimationFrame(animate);
+        }
+
+        function setupScene() {
+            // Create scene, camera, and renderer
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 30);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Setup camera controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.enabled = false;
+        }
+
+        function setupLighting() {
+            // Ambient light for overall illumination - increased intensity
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            // Create a directional light with increased intensity
+            directionalLight = new THREE.DirectionalLight(0xffffff, 4); // Increased intensity
+            directionalLight.position.set(0, 15, 10); // Initial position
+            directionalLight.castShadow = true; // Enable shadows
+
+            // Configure shadow properties
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            directionalLight.shadow.camera.near = 1;
+            directionalLight.shadow.camera.far = 50;
+            directionalLight.shadow.camera.left = -20;
+            directionalLight.shadow.camera.right = 20;
+            directionalLight.shadow.camera.top = 20;
+            directionalLight.shadow.camera.bottom = -20;
+
+            // Add a target for the directional light
+            const lightTarget = new THREE.Object3D();
+            lightTarget.position.set(0, 0, 0); // Initially point to the center of the scene
+            scene.add(lightTarget);
+            directionalLight.target = lightTarget;
+
+            scene.add(directionalLight);
+        }
+
+        function setupHarp() {
+            // Load wood texture
+            const textureLoader = new THREE.TextureLoader();
+            const woodTexture = textureLoader.load('https://threejs.org/examples/textures/hardwood2_diffuse.jpg');
+            woodTexture.wrapS = THREE.RepeatWrapping;
+            woodTexture.wrapT = THREE.RepeatWrapping;
+            woodTexture.repeat.set(1, 1);
+
+            const woodMaterial = new THREE.MeshStandardMaterial({
+                map: woodTexture,
+                roughness: 0.4, // Reduced roughness for better reflections
+                metalness: 0.2, // Slightly metallic for a polished look
+            });
+
+            // Create harp frame
+            harpFrame = new THREE.Group();
+            scene.add(harpFrame);
+
+            // Top bar (taller for tuning pegs and labels) - UNCHANGED
+            const topBar = new THREE.Mesh(
+                new THREE.BoxGeometry(16, 3, 2), // Unchanged
+                woodMaterial
+            );
+            topBar.position.y = 12; // Unchanged
+            topBar.castShadow = true;
+            topBar.receiveShadow = true;
+            harpFrame.add(topBar);
+
+            // Bottom bar
+            const bottomBar = new THREE.Mesh(
+                new THREE.BoxGeometry(16, 1, 2),
+                woodMaterial
+            );
+            bottomBar.position.y = -10;
+            bottomBar.castShadow = true;
+            bottomBar.receiveShadow = true;
+            harpFrame.add(bottomBar);
+
+            // Calculate correct dimensions to prevent overlapping
+            // Top bar extends from y=10.5 to y=13.5 (given height 3 at position 12)
+            // Bottom bar extends from y=-10.5 to y=-9.5 (given height 1 at position -10)
+            const sideBarHeight = 20; // Distance from bottom of top bar to top of bottom bar
+            const sideBarY = 0.5; // Midpoint between bottom of top bar and top of bottom bar
+
+            // Left bar
+            const leftBar = new THREE.Mesh(
+                new THREE.BoxGeometry(1, sideBarHeight, 2),
+                woodMaterial
+            );
+            leftBar.position.set(-7.5, sideBarY, 0);
+            leftBar.castShadow = true;
+            leftBar.receiveShadow = true;
+            harpFrame.add(leftBar);
+
+            // Right bar
+            const rightBar = new THREE.Mesh(
+                new THREE.BoxGeometry(1, sideBarHeight, 2),
+                woodMaterial
+            );
+            rightBar.position.set(7.5, sideBarY, 0);
+            rightBar.castShadow = true;
+            rightBar.receiveShadow = true;
+            harpFrame.add(rightBar);
+
+            // Create strings and tuning pegs
+            createStringsAndPegs();
+
+            // Add labels for tuning pegs (ensure strings are populated first)
+            addTuningPegLabels();
+        }
+
+        function createStringsAndPegs() {
+            const spacing = 3; // Horizontal spacing between strings
+            const startX = -4.5; // Starting x-position for the first string
+            const stringLength = 22; // Length of the strings to span from the bottom bar to the top bar
+            const segmentCount = 40; // Double the number of segments
+
+            for (let i = 0; i < 4; i++) {
+                const x = startX + i * spacing;
+                const tuning = STRING_TUNINGS[i];
+
+                // Create tuning peg
+                const pegGeometry = new THREE.CylinderGeometry(0.7, 0.7, 0.42, 16);
+                const pegMaterial = new THREE.MeshStandardMaterial({
+                    color: 0xBBCCFF,
+                    metalness: 0.7,
+                    roughness: 0.1
+                });
+                const peg = new THREE.Mesh(pegGeometry, pegMaterial);
+                peg.rotation.x = Math.PI / 2;
+                peg.position.set(x, 14.4, 0);
+                peg.castShadow = true;
+                // Add this line to set the stringIndex property
+                peg.userData = { stringIndex: i };
+                harpFrame.add(peg);
+                tuningPegs.push(peg);
+
+                // ADD THESE LINES - Create stem for the tuning peg
+                const stemGeometry = new THREE.CylinderGeometry(0.15, 0.15, 1.5, 8);
+                const stemMaterial = new THREE.MeshStandardMaterial({
+                    color: 0xBBCCFF,  // Slightly darker than the peg knob
+                    metalness: 0.7,
+                    roughness: 0.1
+                });
+                const stem = new THREE.Mesh(stemGeometry, stemMaterial);
+                // Position the stem to connect the peg to the frame
+                stem.position.set(x, 13.8, 0); 
+                stem.castShadow = true;
+                harpFrame.add(stem);
+
+                // Create string particles
+                const particles = [];
+                const segmentLength = stringLength / segmentCount;
+
+                for (let j = 0; j <= segmentCount; j++) {
+                    const y = 12 - j * segmentLength;
+
+                    // Create physics body for each particle
+                    const particleBody = new CANNON.Body({
+                        mass: j === 0 || j === segmentCount ? 0 : 0.1, // Fixed at ends, dynamic in the middle
+                        position: new CANNON.Vec3(x, y, 0),
+                        shape: new CANNON.Sphere(0.1) // Small sphere for each particle
+                    });
+
+                    world.addBody(particleBody);
+                    particles.push(particleBody);
+
+                    // Create visual representation
+                    if (j > 0) {
+                        // Create cylinder along the Y-axis (default orientation)
+                        const segmentGeometry = new THREE.CylinderGeometry(0.05, 0.05, segmentLength, 8);
+                        const segmentMaterial = new THREE.MeshStandardMaterial({
+                            color: 0xCCDDFF,
+                            metalness: 0.9,    // High metalness for that metallic shine
+                            roughness: 0.2 
+                        });
+                        const segmentMesh = new THREE.Mesh(segmentGeometry, segmentMaterial);
+                        
+                        // Position at the midpoint between the two particles
+                        // No rotation needed as cylinder is already aligned with Y-axis
+                        segmentMesh.position.set(x, y + segmentLength/2, 0);
+                        segmentMesh.castShadow = true;
+                        harpFrame.add(segmentMesh);
+                        
+                        // Add larger invisible collision mesh for easier clicking
+                        const collisionGeometry = new THREE.CylinderGeometry(0.3, 0.3, segmentLength, 8);
+                        const collisionMaterial = new THREE.MeshBasicMaterial({
+                            transparent: true,
+                            opacity: 0,
+                            depthWrite: false
+                        });
+                        const collisionMesh = new THREE.Mesh(collisionGeometry, collisionMaterial);
+                        collisionMesh.position.set(x, y + segmentLength/2, 0);
+                        harpFrame.add(collisionMesh);
+                        
+                        // Store segment for rendering
+                        stringSegments.push({ 
+                            mesh: segmentMesh, 
+                            bodyA: particles[j-1], 
+                            bodyB: particleBody,
+                            collisionMesh: collisionMesh 
+                        });
+                        stringSegments[stringSegments.length - 1].stringIndex = i;
+                    }
+                }
+
+                // Add constraints between particles
+                for (let j = 1; j <= segmentCount; j++) {
+                    const constraint = new CANNON.DistanceConstraint(particles[j - 1], particles[j], segmentLength);
+                    world.addConstraint(constraint);
+                }
+
+                // Initialize userData for the string
+                strings.push({
+                    particles,
+                    tuning,
+                    segmentLength,
+                    userData: {
+                        segments: [],
+                        segmentsGroup: new THREE.Group(),
+                        tension: frequencyToTension(tuning.freq, stringLength),
+                        frequency: tuning.freq,
+                        length: stringLength,
+                        amplitude: 0,
+                        damping: 0.995,
+                        phase: 0,
+                        isVibrating: false,
+                        material: null,
+                        initialColor: new THREE.Color(0xD4AF37),
+                        activeOscillator: null,  // Add this
+                        activeGainNode: null     // Add this
+                    }
+                });
+            }
+        }
+
+        function loadFont() {
+            const fontLoader = new FontLoader();
+            fontLoader.load('https://threejs.org/examples/fonts/helvetiker_regular.typeface.json', function(loadedFont) {
+                font = loadedFont;
+                
+                // Now that font is loaded, add the labels
+                if (strings.length > 0) {
+                    addTuningPegLabels();
+                } else {
+                    console.error("Strings array is empty. Ensure createStringsAndPegs is called before addTuningPegLabels.");
+                }
+            });
+        }
+
+        function frequencyToNoteAndCents(frequency) {
+            // A4 is 440Hz, which is 69 semitones above C0
+            const A4 = 440;
+            const C0 = A4 * Math.pow(2, -4.75);
+            
+            // Calculate the number of semitones from C0
+            const semitones = 12 * Math.log2(frequency / C0);
+            const roundedSemitones = Math.round(semitones);
+            
+            // Calculate the difference in cents
+            const cents = 100 * (semitones - roundedSemitones);
+            
+            // Determine the note name and octave
+            const noteIndex = (roundedSemitones % 12 + 12) % 12;
+            const octave = Math.floor(roundedSemitones / 12);
+            const noteName = NOTE_NAMES[noteIndex] + octave;
+            
+            return { note: noteName, cents: cents };
+        }
+
+        function frequencyToTension(frequency, length) {
+            // Simplified string physics model: T = (2L * f)^2 * μ
+            // where T is tension, L is length, f is frequency, μ is linear density
+            // We'll use μ = 0.000015 kg/m for nylon strings
+            const linearDensity = 0.000015;
+            return Math.pow(2 * length * frequency, 2) * linearDensity;
+        }
+
+        function tensionToFrequency(tension, length) {
+            // T = (2L * f)^2 * μ, rearranged for f
+            const linearDensity = 0.000015;
+            return Math.sqrt(tension / linearDensity) / (2 * length);
+        }
+
+        function tensionToRadius(tension) {
+            // Simplified model: thicker strings have lower tension
+            // Map tension range to radius range (0.05 to 0.2)
+            // Higher tension = thinner string
+            const minTension = 20;   // N
+            const maxTension = 120;  // N
+            const minRadius = 0.05;
+            const maxRadius = 0.2;
+            
+            // Clamp tension to our range
+            const clampedTension = Math.max(minTension, Math.min(maxTension, tension));
+            
+            // Inverse mapping (higher tension = lower radius)
+            return maxRadius - ((clampedTension - minTension) / (maxTension - minTension)) * (maxRadius - minRadius);
+        }
+
+        // Fix the pluckString function to handle null material
+        function pluckString(string, strength = 1.0) {
+            // Initialize material if not already done
+            if (!string.userData.material) {
+                string.userData.material = new THREE.MeshStandardMaterial({
+                    color: string.userData.initialColor,
+                    emissive: 0x222200
+                });
+            }
+
+            // Play sound - always trigger the sound when plucked
+            playStringSound(string);
+
+            if (string.userData.isVibrating) {
+                // Already vibrating, just add to the amplitude
+                string.userData.amplitude = Math.min(1.0, string.userData.amplitude + strength * 0.5);
+            } else {
+                // Start vibration
+                string.userData.isVibrating = true;
+                string.userData.amplitude = strength;
+                string.userData.phase = 0;
+                string.userData.material.color.set(0xff0000); // Start with red
+            }
+        }
+
+        function updateStringVibration(string, deltaTime) {
+            if (!string.userData.isVibrating) return;
+            
+            // Initialize material if not already done
+            if (!string.userData.material) {
+                string.userData.material = new THREE.MeshStandardMaterial({
+                    color: string.userData.initialColor,
+                    emissive: 0x222200
+                });
+            }
+            
+            const { frequency, amplitude, damping, phase } = string.userData;
+            
+            // Update phase based on frequency
+            string.userData.phase += deltaTime * frequency * Math.PI * 2;
+            
+            // Apply damping
+            string.userData.amplitude *= damping;
+            
+            // If amplitude is too small, stop vibration
+            if (string.userData.amplitude < 0.001) {
+                string.userData.isVibrating = false;
+                string.userData.amplitude = 0;
+                string.userData.material.color.copy(string.userData.initialColor);
+                resetStringPosition(string);
+                return;
+            }
+            
+            // Calculate color based on amplitude (red at max, yellow at rest)
+            const r = 1.0;
+            const g = 1.0 - (string.userData.amplitude * 0.8);
+            const b = 0;
+            string.userData.material.color.setRGB(r, g, b);
+            
+            // Get camera's view direction
+            const cameraDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            
+            // Create a perpendicular vector to the camera's view direction
+            // We use the cross product with the up vector to ensure perpendicularity
+            const upVector = new THREE.Vector3(0, 1, 0);
+            const perpendicularVector = new THREE.Vector3().crossVectors(cameraDirection, upVector).normalize();
+            
+            // First reset string positions to original straight line
+            const { particles } = string;
+            const segmentCount = particles.length - 1;
+            const spacing = 3; // Same as in createStringsAndPegs
+            const startX = -4.5; // Same as in createStringsAndPegs
+            const stringLength = 22; // Same as in createStringsAndPegs
+            const stringIndex = strings.indexOf(string);
+            const baseX = startX + stringIndex * spacing;
+            
+            // Add physics-based approach to visualize vibrations using CANNON.js bodies
+            for (let i = 1; i < string.particles.length - 1; i++) {
+                const particle = string.particles[i];
+                const y = 12 - i * (stringLength / segmentCount);
+                
+                // Reset to original straight position first
+                particle.position.set(baseX, y, 0);
+                
+                // Then calculate displacement perpendicular to camera view
+                const normalizedPos = i / (string.particles.length - 1);
+                const displacementAmount = Math.sin(normalizedPos * Math.PI) * 
+                                         Math.sin(phase) * 
+                                         string.userData.amplitude;
+                
+                // Apply displacement in the direction perpendicular to camera view
+                particle.position.x += perpendicularVector.x * displacementAmount;
+                particle.position.y += perpendicularVector.y * displacementAmount; 
+                particle.position.z += perpendicularVector.z * displacementAmount;
+            }
+        }
+
+        function resetStringPosition(string) {
+            const { particles } = string;
+            const segmentCount = particles.length - 1;
+            const spacing = 3; // Same as in createStringsAndPegs
+            const startX = -4.5; // Same as in createStringsAndPegs
+            const stringLength = 22; // Same as in createStringsAndPegs
+            const stringIndex = strings.indexOf(string);
+            const x = startX + stringIndex * spacing;
+            
+            for (let j = 0; j <= segmentCount; j++) {
+                const y = 12 - j * (stringLength / segmentCount);
+                const particle = particles[j];
+                
+                // Reset to original position
+                particle.position.set(x, y, 0);
+            }
+        }
+
+        // In the initAudio function, add this:
+        function initAudio() {
+            // Initialize audio context on first user interaction
+            document.addEventListener('click', function initAudioOnFirstClick() {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    
+                    // Create master gain node for overall volume control
+                    masterGainNode = audioContext.createGain();
+                    masterGainNode.gain.value = 0.6; // Set master volume to 60%
+                    masterGainNode.connect(audioContext.destination);
+                    
+                    // Add a compressor to prevent distortion
+                    const compressor = audioContext.createDynamicsCompressor();
+                    compressor.threshold.value = -24;
+                    compressor.knee.value = 30;
+                    compressor.ratio.value = 4;
+                    compressor.attack.value = 0.003;
+                    compressor.release.value = 0.25;
+                    
+                    // Connect the compressor between master gain and destination
+                    masterGainNode.disconnect();
+                    masterGainNode.connect(compressor);
+                    compressor.connect(audioContext.destination);
+                }
+                document.removeEventListener('click', initAudioOnFirstClick);
+            });
+        }
+
+        // Update the playStringSound function
+        function playStringSound(string) {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // Create master gain node if it doesn't exist
+                masterGainNode = audioContext.createGain();
+                masterGainNode.gain.value = 0.8;
+                masterGainNode.connect(audioContext.destination);
+            }
+
+            const { particles } = string;
+            const amplitude = particles.reduce((sum, particle, index) => {
+                if (index === 0 || index === particles.length - 1) return sum;
+                return sum + Math.abs(particle.position.z);
+            }, 0) / particles.length;
+
+            const frequency = string.tuning.freq;
+
+            // If there's already an active oscillator, stop it
+            if (string.userData.activeOscillator) {
+                string.userData.activeOscillator.stop();
+                string.userData.activeOscillator = null;
+                string.userData.activeGainNode = null;
+                activeOscillatorCount--;
+            }
+
+            // Increment active oscillator count
+            activeOscillatorCount++;
+            
+            // Dynamically adjust volume based on how many strings are playing
+            const volumeScaleFactor = 1 / Math.sqrt(activeOscillatorCount);
+
+            // Create oscillator
+            const oscillator = audioContext.createOscillator();
+            oscillator.type = 'triangle';
+            oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
+
+            // Create gain node for amplitude and decay
+            const gainNode = audioContext.createGain();
+            // Lower base volume and scale based on number of active strings
+            const baseVolume = 0.3 * volumeScaleFactor; // Reduced from 0.5
+            const volumeMultiplier = 0.3 * volumeScaleFactor; // Reduced from 0.5
+            gainNode.gain.setValueAtTime(baseVolume + (amplitude * volumeMultiplier), audioContext.currentTime);
+
+            // Apply decay
+            const decayTime = 5.0; // seconds
+            gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + decayTime);
+
+            // Connect to master gain node instead of directly to destination
+            oscillator.connect(gainNode);
+            gainNode.connect(masterGainNode);
+            oscillator.start();
+            
+            // Store references to the active audio nodes
+            string.userData.activeOscillator = oscillator;
+            string.userData.activeGainNode = gainNode;
+            
+            // Set up cleanup when the sound ends
+            setTimeout(() => {
+                if (string.userData.activeOscillator === oscillator) {
+                    string.userData.activeOscillator = null;
+                    string.userData.activeGainNode = null;
+                    activeOscillatorCount = Math.max(0, activeOscillatorCount - 1);
+                }
+            }, decayTime * 1000);
+            
+            oscillator.stop(audioContext.currentTime + decayTime);
+        }
+
+        function updateTuningPeg(pegIndex, deltaY) {
+            const peg = tuningPegs[pegIndex];
+            const string = strings[pegIndex];
+            
+            // Rotate peg (keep visual rotation the same)
+            const rotationAmount = deltaY * 0.05;
+            peg.rotation.z += rotationAmount;
+            
+            // Update string tension and frequency (5x more sensitive)
+            const tensionDelta = deltaY * -20.0;
+            string.userData.tension = Math.max(10, string.userData.tension + tensionDelta);
+            
+            // Update string frequency based on tension
+            const newFrequency = tensionToFrequency(string.userData.tension, string.userData.length);
+            string.userData.frequency = newFrequency;
+            
+            // IMPORTANT: Update the tuning object as well so labels show correct values
+            string.tuning.freq = newFrequency;
+            
+            // UPDATE ACTIVE SOUND - this is the key addition
+            if (string.userData.activeOscillator) {
+                string.userData.activeOscillator.frequency.setValueAtTime(
+                    newFrequency, 
+                    audioContext.currentTime
+                );
+            }
+            
+            // Update string radius based on tension
+            const newRadius = tensionToRadius(string.userData.tension);
+            string.userData.baseRadius = newRadius;
+            
+            // Update labels - first clear old labels
+            labelMeshes.forEach(mesh => {
+                mesh.geometry.dispose();
+                mesh.material.dispose();
+                harpFrame.remove(mesh);
+            });
+            labelMeshes = [];
+            
+            // Add new labels with updated values
+            addTuningPegLabels();
+        }
+
+        function setupEventListeners() {
+            // Resize handling
+            window.addEventListener('resize', onWindowResize);
+            
+            // Keyboard events
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+            
+            // Mouse events
+            document.addEventListener('mousedown', onMouseDown);
+            document.addEventListener('mouseup', onMouseUp);
+            document.addEventListener('mousemove', onMouseMove);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Modify the existing keyDown handler to detect number keys
+        function onKeyDown(event) {
+            // Handle spacebar
+            if (event.code === 'Space' && !spacebarDown) {
+                spacebarDown = true;
+                controls.enabled = true;
+                
+                // If a chord was active, restore original tunings
+                if (activeChordKey !== null) {
+                    restoreOriginalTunings();
+                    activeChordKey = null;
+                }
+                
+                return;
+            }
+            
+            // Handle number keys 1-7 (only if spacebar is not pressed)
+            if (!spacebarDown && event.code.startsWith('Digit') && !event.repeat) {
+                const digit = parseInt(event.code.slice(-1));
+                if (digit >= 1 && digit <= 7) {
+                    // If a different chord was active, restore original tunings first
+                    if (activeChordKey !== null && activeChordKey !== digit) {
+                        restoreOriginalTunings();
+                    }
+                    
+                    // Apply the new chord
+                    activeChordKey = digit;
+                    applyChordTuning(digit - 1); // Array is 0-indexed
+                }
+            }
+        }
+
+        // Modify the existing keyUp handler
+        function onKeyUp(event) {
+            // Handle spacebar
+            if (event.code === 'Space') {
+                spacebarDown = false;
+                controls.enabled = false;
+                
+                // If a number key is still pressed, reapply that chord
+                if (activeChordKey !== null) {
+                    applyChordTuning(activeChordKey - 1);
+                }
+                
+                return;
+            }
+            
+            // Handle number keys 1-7
+            if (event.code.startsWith('Digit')) {
+                const digit = parseInt(event.code.slice(-1));
+                if (digit >= 1 && digit <= 7 && digit === activeChordKey) {
+                    // Restore original tunings when the active chord key is released
+                    activeChordKey = null;
+                    restoreOriginalTunings();
+                }
+            }
+        }
+
+        function onMouseDown(event) {
+            event.preventDefault();
+
+            mouseDown = true;
+
+            // Calculate normalized mouse coordinates
+            mousePosition.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mousePosition.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            // Store for velocity calculation
+            lastMousePosition.copy(mousePosition);
+            lastMouseTime = performance.now();
+
+            // If spacebar is held, don't do interaction
+            if (spacebarDown) return;
+
+            // Check for intersections
+            raycaster.setFromCamera(mousePosition, camera);
+
+            // NEW: Check for clicks on digital displays
+            const labelIntersects = raycaster.intersectObjects(labelMeshes);
+            if (labelIntersects.length > 0) {
+                const labelIndex = labelMeshes.indexOf(labelIntersects[0].object);
+                if (labelIndex >= 0) {
+                    const string = strings[labelIndex];
+                    
+                    // Get current frequency and snap to nearest note
+                    const currentFreq = string.tuning.freq;
+                    const nearestNoteFreq = snapToNearestNote(currentFreq);
+                    
+                    // Update string frequency and tension
+                    string.userData.frequency = nearestNoteFreq;
+                    string.tuning.freq = nearestNoteFreq;
+                    string.userData.tension = frequencyToTension(nearestNoteFreq, string.userData.length);
+                    
+                    // Update active oscillator if the string is currently playing
+                    if (string.userData.activeOscillator) {
+                        string.userData.activeOscillator.frequency.setValueAtTime(
+                            nearestNoteFreq, 
+                            audioContext.currentTime
+                        );
+                    }
+                    
+                    // Update labels
+                    labelMeshes.forEach(mesh => {
+                        mesh.geometry.dispose();
+                        mesh.material.dispose();
+                        harpFrame.remove(mesh);
+                    });
+                    labelMeshes = [];
+                    
+                    // Add new labels with updated values
+                    addTuningPegLabels();
+                    
+                    return;
+                }
+            }
+
+            // Rest of the existing onMouseDown function...
+            // Check tuning pegs
+            const pegIntersects = raycaster.intersectObjects(tuningPegs);
+            if (pegIntersects.length > 0) {
+                activeDraggingPeg = pegIntersects[0].object;
+                dragStartY = event.clientY;
+                return;
+            }
+
+            // Check strings, including both visible segments and collision meshes
+            const stringObjects = strings.map(s => s.userData.segmentsGroup).filter(obj => obj !== null && obj !== undefined);
+            const validStringSegments = stringSegments.filter(segment => segment.mesh !== null && segment.mesh !== undefined);
+            
+            // Include both visible meshes and collision meshes in the intersection check
+            const meshesToCheck = [
+                ...stringObjects,
+                ...validStringSegments.map(segment => segment.mesh),
+                ...validStringSegments.map(segment => segment.collisionMesh).filter(mesh => mesh !== undefined)
+            ];
+
+            const stringIntersects = raycaster.intersectObjects(meshesToCheck);
+
+            if (stringIntersects.length > 0) {
+                // Find the string
+                let selectedString = null;
+                const hitObject = stringIntersects[0].object;
+                
+                // Check if it's a string segment or collision mesh
+                const hitSegmentIndex = stringSegments.findIndex(seg => 
+                    seg.mesh === hitObject || seg.collisionMesh === hitObject
+                );
+                
+                if (hitSegmentIndex >= 0) {
+                    const stringIndex = stringSegments[hitSegmentIndex].stringIndex;
+                    selectedString = strings[stringIndex];
+                }
+                
+                // Check if it's a segmentsGroup (for backwards compatibility)
+                if (!selectedString) {
+                    for (let i = 0; i < strings.length; i++) {
+                        if (strings[i].userData.segmentsGroup === hitObject) {
+                            selectedString = strings[i];
+                            break;
+                        }
+                    }
+                }
+
+                if (selectedString) {
+                    // Always allow plucking on direct clicks
+                    pluckString(selectedString, 0.7);
+                }
+            }
+
+            // Reset intersectedObject on mouse down so we can click the same string again
+            intersectedObject = null;
+        }
+
+        function onMouseUp(event) {
+            mouseDown = false;
+            activeDraggingPeg = null;
+        }
+
+        function onMouseMove(event) {
+            // Get previous and current mouse positions
+            const prevMouseX = mousePosition.x;
+            const prevMouseY = mousePosition.y;
+            
+            // Update current mouse position
+            mousePosition.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mousePosition.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            // Calculate mouse velocity
+            const currentTime = performance.now();
+            const dt = (currentTime - lastMouseTime) / 1000; // convert to seconds
+
+            if (dt > 0) {
+                mouseVelocity.x = (mousePosition.x - prevMouseX) / dt;
+                mouseVelocity.y = (mousePosition.y - prevMouseY) / dt;
+                lastMouseTime = currentTime;
+            }
+
+            // If spacebar is held, don't do interaction
+            if (spacebarDown) return;
+
+            // Handle tuning peg dragging
+            if (mouseDown && activeDraggingPeg) {
+                const deltaY = event.clientY - dragStartY;
+                const stringIndex = activeDraggingPeg.userData.stringIndex;
+                updateTuningPeg(stringIndex, deltaY * 0.05);
+                dragStartY = event.clientY;
+                return;
+            }
+
+            // Handle string strumming when mouse is down but not over a tuning peg
+            if (mouseDown && !activeDraggingPeg) {
+                // Create a set to track which strings have been plucked in this motion
+                const pluckedStringsThisMotion = new Set();
+                
+                // Check multiple points along the mouse movement path for better detection
+                const steps = 5; // Number of steps to check between previous and current position
+                
+                for (let i = 0; i <= steps; i++) {
+                    // Interpolate position between previous and current mouse position
+                    const t = i / steps;
+                    const checkX = prevMouseX + (mousePosition.x - prevMouseX) * t;
+                    const checkY = prevMouseY + (mousePosition.y - prevMouseY) * t;
+                    
+                    // Set raycaster to this interpolated position
+                    raycaster.setFromCamera(new THREE.Vector2(checkX, checkY), camera);
+                    
+                    // Get valid objects to check
+                    const stringObjects = strings
+                        .map(s => s.userData.segmentsGroup)
+                        .filter(obj => obj !== null && obj !== undefined);
+                    
+                    const validStringSegments = stringSegments
+                        .filter(segment => segment.mesh !== null && segment.mesh !== undefined);
+                    
+                    // Include both visible meshes and collision meshes
+                    const meshesToCheck = [
+                        ...stringObjects,
+                        ...validStringSegments.map(segment => segment.mesh),
+                        ...validStringSegments.map(segment => segment.collisionMesh).filter(mesh => mesh !== undefined)
+                    ];
+
+                    // Check ALL intersections, not just the first one
+                    const stringIntersects = raycaster.intersectObjects(meshesToCheck);
+                    
+                    // Process all intersections
+                    for (const intersection of stringIntersects) {
+                        let selectedString = null;
+                        const hitObject = intersection.object;
+                        
+                        // Check if it's a string segment or collision mesh
+                        const hitSegmentIndex = stringSegments.findIndex(seg => 
+                            seg.mesh === hitObject || seg.collisionMesh === hitObject
+                        );
+                        
+                        if (hitSegmentIndex >= 0) {
+                            const stringIndex = stringSegments[hitSegmentIndex].stringIndex;
+                            selectedString = strings[stringIndex];
+                        } else {
+                            // Check if it's a segmentsGroup
+                            for (let i = 0; i < strings.length; i++) {
+                                if (strings[i].userData.segmentsGroup === hitObject) {
+                                    selectedString = strings[i];
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // If we found a string and haven't already plucked it in this motion
+                        if (selectedString && !pluckedStringsThisMotion.has(selectedString)) {
+                            // Calculate strength based on mouse velocity
+                            const velocityMagnitude = Math.sqrt(
+                                mouseVelocity.x * mouseVelocity.x + mouseVelocity.y * mouseVelocity.y
+                            );
+
+                            const normalizedStrength = Math.min(
+                                1.0,
+                                Math.max(0.2, velocityMagnitude / 20)
+                            );
+
+                            // Pluck the string
+                            pluckString(selectedString, normalizedStrength);
+                            
+                            // Add to our set of plucked strings for this motion
+                            pluckedStringsThisMotion.add(selectedString);
+                            
+                            // Update intersectedObject to the last string we plucked
+                            intersectedObject = selectedString;
+                        }
+                    }
+                }
+                
+                // If we didn't intersect with any strings, reset intersectedObject
+                if (pluckedStringsThisMotion.size === 0) {
+                    intersectedObject = null;
+                }
+            }
+        }
+
+        // Replace your animate function with this working version
+        function animate(currentTime) {
+            // Convert to seconds (currentTime is in milliseconds)
+            currentTime = currentTime || 0;
+            currentTime *= 0.001;
+            
+            // Calculate delta time in seconds
+            let deltaTime = lastFrameTime ? currentTime - lastFrameTime : 1/60;
+            
+            // Clamp deltaTime to prevent huge jumps if the tab is inactive
+            // or if there's a significant frame drop
+            deltaTime = Math.min(deltaTime, 0.1);
+            
+            // Store the current time for the next frame
+            lastFrameTime = currentTime;
+            
+            // Request the next frame
+            requestAnimationFrame(animate);
+
+            // Step the physics world
+            world.step(deltaTime);
+
+            // Update string segments
+            stringSegments.forEach(({ mesh, bodyA, bodyB, collisionMesh }) => {
+                const posA = bodyA.position;
+                const posB = bodyB.position;
+                
+                // Calculate the midpoint between particles
+                const midX = (posA.x + posB.x) / 2;
+                const midY = (posA.y + posB.y) / 2;
+                const midZ = (posA.z + posB.z) / 2;
+                
+                // Update position to the midpoint
+                mesh.position.set(midX, midY, midZ);
+                
+                // Update collision mesh position too
+                if (collisionMesh) {
+                    collisionMesh.position.set(midX, midY, midZ);
+                }
+                
+                // Calculate the distance and direction vector between particles
+                const dx = posB.x - posA.x;
+                const dy = posB.y - posA.y;
+                const dz = posB.z - posA.z;
+                const length = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                
+                // Scale the cylinder to match the distance between particles
+                mesh.scale.y = length / mesh.geometry.parameters.height;
+                
+                // Scale collision mesh too
+                if (collisionMesh) {
+                    collisionMesh.scale.y = length / collisionMesh.geometry.parameters.height;
+                }
+                
+                // Orient the cylinder to point from particleA to particleB
+                if (length > 0) {
+                    // Set quaternion directly for more precise orientation
+                    const direction = new THREE.Vector3(dx/length, dy/length, dz/length);
+                    mesh.quaternion.setFromUnitVectors(
+                        new THREE.Vector3(0, 1, 0), // Y-axis unit vector (cylinder's default direction)
+                        direction // Normalized direction vector
+                    );
+                    
+                    // Orient collision mesh the same way
+                    if (collisionMesh) {
+                        collisionMesh.quaternion.copy(mesh.quaternion);
+                    }
+                }
+            });
+
+            // Update string vibrations
+            strings.forEach(string => {
+                updateStringVibration(string, deltaTime);
+            });
+
+            // Render scene
+            renderer.render(scene, camera);
+        }
+
+        function addTuningPegLabels() {
+            if (!font) return; // Ensure font is loaded
+
+            const labelBackgroundMaterial = new THREE.MeshStandardMaterial({
+                color: 0x010101, // Dark background
+                roughness: 0.0,
+                metalness: 0.5
+            });
+
+            tuningPegs.forEach((peg, index) => {
+                const string = strings[index]; // Access the string data
+                if (!string || !string.tuning) {
+                    console.error(`String data is missing for index ${index}`);
+                    return;
+                }
+
+                const { freq: frequency } = string.tuning;
+                const stringLength = string.segmentLength * (string.particles.length - 1); // Calculate string length
+                const tension = frequencyToTension(frequency, stringLength); // Calculate tension
+                const { note, cents } = frequencyToNoteAndCents(frequency);
+
+                // Create label background
+                const backgroundGeometry = new THREE.PlaneGeometry(2, 2); // Adjusted background size
+                const backgroundMesh = new THREE.Mesh(backgroundGeometry, labelBackgroundMaterial);
+                backgroundMesh.position.set(peg.position.x, 12.1, 1.01); // Positioned on the top bar
+                harpFrame.add(backgroundMesh);
+
+                // Create canvas for text
+                const canvas = document.createElement('canvas');
+                canvas.width = 128;
+                canvas.height = 128;
+                const ctx = canvas.getContext('2d');
+
+                // Draw text on canvas
+                ctx.fillStyle = '#000000'; // Background color
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.textAlign = 'center';
+                ctx.font = '24px Arial';
+                ctx.fillStyle = '#00ff00'; // Lime for tension
+                ctx.fillText(`${tension.toFixed(1)}N`, 64, 30);
+
+                ctx.fillStyle = '#00ffff'; // Aqua for frequency
+                ctx.fillText(`${frequency.toFixed(1)}Hz`, 64, 70);
+
+                ctx.fillStyle = '#ffff00'; // Yellow for note
+                const noteText = cents === 0 ? `${note}` : `${note}${cents > 0 ? '+' : ''}${cents.toFixed(0)}c`;
+                ctx.fillText(noteText, 64, 110);
+
+                ctx.textAlign = 'left';
+
+                // Create texture from canvas
+                const texture = new THREE.CanvasTexture(canvas);
+                const textMaterial = new THREE.MeshBasicMaterial({ map: texture });
+                textMaterial.transparent = true;
+
+                // Apply texture to the background mesh
+                backgroundMesh.material = textMaterial;
+
+                // Store mesh for later updates
+                labelMeshes.push(backgroundMesh);
+            });
+        }
+
+        function setupPhysics() {
+            world = new CANNON.World();
+            world.gravity.set(0, 0, 0); // Gravity (optional, can be set to zero for strings)
+            world.broadphase = new CANNON.NaiveBroadphase();
+            world.solver.iterations = 10;
+        }
+
+        // Add this function to convert note names to frequencies
+        function noteToFrequency(note) {
+            const notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            const noteName = note.substring(0, note.length - 1);
+            const octave = parseInt(note.substring(note.length - 1));
+            
+            const noteIndex = notes.indexOf(noteName);
+            if (noteIndex === -1) return null;
+            
+            const A4 = 440;
+            const A4Index = 9 + (4 * 12); // A4 is 9 semitones above C, plus 4 octaves * 12 semitones
+            const noteDistance = (octave * 12) + noteIndex - A4Index;
+            return A4 * Math.pow(2, noteDistance / 12);
+        }
+
+        // Function to apply a chord tuning
+        function applyChordTuning(chordIndex) {
+            if (chordIndex < 0 || chordIndex >= chordTunings.length) return;
+            
+            // Store original tunings if not already stored
+            if (originalTunings.length === 0) {
+                originalTunings = strings.map(string => ({
+                    freq: string.tuning.freq,
+                    tension: string.userData.tension
+                }));
+            }
+            
+            const chord = chordTunings[chordIndex];
+            
+            // Apply new tunings
+            for (let i = 0; i < strings.length; i++) {
+                const string = strings[i];
+                const note = chord[i];
+                const frequency = noteToFrequency(note);
+                
+                if (frequency) {
+                    // Update string properties
+                    string.tuning.freq = frequency;
+                    string.userData.frequency = frequency;
+                    string.userData.tension = frequencyToTension(frequency, string.userData.length);
+                    
+                    // Update active oscillator if string is playing
+                    if (string.userData.activeOscillator) {
+                        string.userData.activeOscillator.frequency.setValueAtTime(
+                            frequency,
+                            audioContext.currentTime
+                        );
+                    }
+                }
+            }
+            
+            // Update displays
+            updateTuningDisplays();
+        }
+
+        // Function to restore original tunings
+        function restoreOriginalTunings() {
+            if (originalTunings.length === 0) return;
+            
+            for (let i = 0; i < strings.length; i++) {
+                const string = strings[i];
+                const original = originalTunings[i];
+                
+                // Restore original values
+                string.tuning.freq = original.freq;
+                string.userData.frequency = original.freq;
+                string.userData.tension = original.tension;
+                
+                // Update active oscillator if string is playing
+                if (string.userData.activeOscillator) {
+                    string.userData.activeOscillator.frequency.setValueAtTime(
+                        original.freq,
+                        audioContext.currentTime
+                    );
+                }
+            }
+            
+            // Clear stored originals
+            originalTunings = [];
+            
+            // Update displays
+            updateTuningDisplays();
+        }
+
+        // Helper function to update the tuning displays
+        function updateTuningDisplays() {
+            // Clear old labels
+            labelMeshes.forEach(mesh => {
+                mesh.geometry.dispose();
+                mesh.material.dispose();
+                harpFrame.remove(mesh);
+            });
+            labelMeshes = [];
+            
+            // Add new labels
+            addTuningPegLabels();
+        }
+
+        // Add this function to snap a frequency to the nearest musical note
+        function snapToNearestNote(frequency) {
+            // A4 is 440Hz, which is 69 semitones above C0
+            const A4 = 440;
+            const C0 = A4 * Math.pow(2, -4.75);
+            
+            // Calculate the number of semitones from C0 (including fractional part)
+            const semitones = 12 * Math.log2(frequency / C0);
+            
+            // Round to the nearest integer semitone
+            const roundedSemitones = Math.round(semitones);
+            
+            // Calculate the frequency of the nearest note
+            const nearestNoteFrequency = C0 * Math.pow(2, roundedSemitones / 12);
+            
+            return nearestNoteFrequency;
+        }
+    </script>
+</body>
+</html>
